@@ -163,12 +163,21 @@ def search_nycu_theses(
 
     result_urls = extract_nycu_result_urls(
         driver.page_source, driver.current_url
-    )
+    )[:100]
+    total_attempts = len(result_urls)
     records = []
+    progress_line_open = False
     for index, url in enumerate(result_urls, start=1):
         if len(records) >= int(sample_count):
             break
-        print(f"論文連結：{url}")
+        completed = int(20 * index / total_attempts) if total_attempts else 20
+        bar = "█" * completed + "░" * (20 - completed)
+        print(
+            f"\r檢查進度：[{bar}] {index}/{total_attempts}",
+            end="",
+            flush=True,
+        )
+        progress_line_open = True
         driver.get(url)
         try:
             wait_for_css(driver, "ds-untyped-item")
@@ -184,6 +193,9 @@ def search_nycu_theses(
         if record is None:
             continue
 
+        print()
+        progress_line_open = False
+        print(f"論文連結：{url}")
         entry_year = (
             record.entry_year if record.entry_year is not None else "年限未知"
         )
@@ -198,6 +210,8 @@ def search_nycu_theses(
         print(f"入學年度：{entry_year}")
         print(f"畢業年度 - 入學年度：{year_difference}")
         records.append(record)
+    if progress_line_open:
+        print()
     return records
 
 

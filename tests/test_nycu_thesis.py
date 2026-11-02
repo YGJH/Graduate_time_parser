@@ -178,6 +178,36 @@ class NycuChromeConfigurationTest(unittest.TestCase):
 
 
 class NycuBrowserFlowTest(unittest.TestCase):
+    def test_shows_progress_and_never_checks_more_than_one_hundred_results(self):
+        search_html = "".join(
+            f'<li data-test="list-object"><a class="item-list-title" href="/items/{index}">item</a></li>'
+            for index in range(1, 102)
+        )
+        wrong_page = THESIS_PAGE_WITH_REORDERED_FIELDS.replace(
+            "蔡淳仁", "其他教授"
+        )
+        driver = FakeNycuDriver(
+            search_html,
+            {
+                f"https://thesis.lib.nycu.edu.tw/items/{index}": wrong_page
+                for index in range(1, 102)
+            },
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            records = lab_census_system.search_nycu_theses(
+                driver, "蔡淳仁", 1, wait_for_css=fake_wait_for_css
+            )
+
+        checked_urls = [url for url in driver.visited if "/items/" in url]
+        self.assertEqual([], records)
+        self.assertEqual(100, len(checked_urls))
+        self.assertNotIn(
+            "https://thesis.lib.nycu.edu.tw/items/101", checked_urls
+        )
+        self.assertIn("100/100", output.getvalue())
+
     def test_prints_unknown_for_a_future_entry_year(self):
         search_html = """
         <li data-test="list-object"><a class="item-list-title" href="/items/future">future</a></li>
@@ -218,8 +248,14 @@ class NycuBrowserFlowTest(unittest.TestCase):
         search = getattr(lab_census_system, "search_nycu_theses", None)
 
         self.assertIsNotNone(search, "陽明交大 Selenium 搜尋流程尚未實作")
-        records = search(driver, "蔡淳仁", 1, wait_for_css=fake_wait_for_css)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            records = search(
+                driver, "蔡淳仁", 1, wait_for_css=fake_wait_for_css
+            )
 
+        self.assertNotIn("items/wrong", output.getvalue())
+        self.assertIn("items/right", output.getvalue())
         self.assertEqual("蔡淳仁", driver.query)
         self.assertEqual(1, len(records))
         self.assertEqual("王小明", records[0].author)
