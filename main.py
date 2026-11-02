@@ -14,12 +14,12 @@ def run(input_fn=input, system_factory=lab_census_system.LabCensusSystem):
         print(error)
         return
     result = system.Show()
-    print(f"最近 {sample_count} 筆碩士畢業生紀錄中")
-    print(f"{result[0]}\t位第一年畢業")
-    print(f"{result[1]}\t位第二年畢業")
-    print(f"{result[2]}\t位第三年畢業")
-    print(f"{result[3]}\t位第四年畢業")
-    print(f"{result[4]}\t位第五年以上畢業")
+    actual_count = sum(result)
+    print(f"實際取得 {actual_count} 筆符合條件的碩士畢業生紀錄")
+    print(f"{result[0] + result[1]}\t位第一年畢業")
+    print(f"{result[2]}\t位第二年畢業")
+    print(f"{result[3]}\t位第三年畢業")
+    print(f"{result[4]}\t位第四年畢業 or 更久")
 
 
 if __name__ == "__main__":

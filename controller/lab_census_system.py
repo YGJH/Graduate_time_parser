@@ -304,6 +304,108 @@ def parse_nycu_thesis(html, url, advisor_name, current_roc_year=None):
     )
 
 
+def _legacy_field_text(page, *labels):
+    normalized = {label.rstrip(":：") for label in labels}
+    heading = page.find(
+        "th",
+        string=lambda text: text
+        and text.strip().rstrip(":：") in normalized,
+    )
+    if heading is None or heading.find_next_sibling() is None:
+        return None
+    return heading.find_next_sibling().get_text(" ", strip=True)
+
+
+def _legacy_advisor_names(page):
+    text = _legacy_field_text(page, "指導教授") or ""
+    return {
+        name
+        for name in re.split(r"[\s、,，;/；]+", text)
+        if name
+    }
+
+
+def parse_legacy_thesis(html, url, advisor_name, school):
+    page = BeautifulSoup(html, "html.parser")
+    if advisor_name not in _legacy_advisor_names(page):
+        return None
+
+    author = _legacy_field_text(page, "作者", "作者(中文)")
+    student_id = _legacy_field_text(page, "學號")
+    graduation_year_text = _legacy_field_text(page, "畢業學年度")
+    if not all((author, student_id, graduation_year_text)):
+        raise ValueError("論文頁缺少作者、學號或畢業學年度")
+
+    converters = {
+        "1": id_converter.NCTU,
+        "2": id_converter.NCU,
+        "3": id_converter.NTHU,
+        "4": id_converter.NYMU,
+    }
+    entry_year = int(converters[school](student_id))
+    graduation_year = int(re.search(r"\d+", graduation_year_text).group())
+    return NycuThesis(
+        url=url,
+        author=author,
+        graduation_year=graduation_year,
+        student_id=student_id,
+        entry_year=entry_year,
+        year_difference=graduation_year - entry_year,
+    )
+
+
+def collect_legacy_theses(
+    browser,
+    record_url_base,
+    advisor_name,
+    school,
+    sample_count,
+    department_filters,
+    max_attempts=None,
+):
+    max_attempts = max_attempts or int(sample_count) + 100
+    records = []
+    seen_student_ids = set()
+    duplicate_streak = 0
+
+    for index in range(1, max_attempts + 1):
+        if len(records) >= int(sample_count):
+            break
+        url = f"{record_url_base}?r1={index}"
+        browser.open(url)
+        page = browser.get_current_page()
+
+        degree = _legacy_field_text(page, "學位類別")
+        department = _legacy_field_text(page, "系所名稱")
+        student_id = _legacy_field_text(page, "學號")
+        if student_id is None:
+            break
+        if degree == "博士" or department in department_filters:
+            continue
+
+        record = parse_legacy_thesis(
+            str(page), url, advisor_name, school
+        )
+        if record is None:
+            continue
+        if student_id in seen_student_ids:
+            duplicate_streak += 1
+            if duplicate_streak >= 3:
+                break
+            continue
+
+        duplicate_streak = 0
+        seen_student_ids.add(student_id)
+        print(f"論文連結：{record.url}")
+        print(f"作者：{record.author}")
+        print(f"畢業年度：{record.graduation_year}")
+        print(f"學號：{record.student_id}")
+        print(f"入學年度：{record.entry_year}")
+        print(f"畢業年度 - 入學年度：{record.year_difference}")
+        records.append(record)
+    return records
+
+
 def solve_captcha(browser, classifier, max_attempts=3):
     for _ in range(max_attempts):
         page = browser.get_current_page()
@@ -373,6 +475,17 @@ class LabCensusSystem:
             ]
         return self.verbose_input
 
+    def search_legacy_records(self, browser, record_url_base):
+        records = collect_legacy_theses(
+            browser,
+            record_url_base,
+            advisor_name=self.name,
+            school=self.school,
+            sample_count=self.sample_count,
+            department_filters=self.filter,
+        )
+        return self.load_nycu_records(records)
+
     def search_new_nycu(self, driver=None, wait_for_css=None):
         owns_driver = driver is None
         if owns_driver:
@@ -416,6 +529,9 @@ class LabCensusSystem:
         browser.select_form('form[name="main"]')
         browser["sortby"] = "-yr"
         # browser["SubmitChangePage"] = "1"
+
+        if self.school == "2":
+            return self.search_legacy_records(browser, record_url_base)
 
         # Y2：兩年畢業、Y2_3：兩年以上三年以下畢業，以此類推；previous_number用來紀錄前一筆的學號
         previous_number, i = 0, 0
@@ -486,16 +602,16 @@ class LabCensusSystem:
             calculate = int(grad_year) - int(enter_year)
             if calculate == 0:
                 self.result[0] += 1
-                new = {student_name:[int(enter_year),"1"]}
+                new = {student_name:[int(enter_year),str(calculate)]}
             elif calculate == 1:
                 self.result[1] += 1
-                new = {student_name:[int(enter_year),"2"]}
+                new = {student_name:[int(enter_year),str(calculate)]}
             elif calculate == 2:
                 self.result[2] += 1
-                new = {student_name:[int(enter_year),"2_3"]}
+                new = {student_name:[int(enter_year),str(calculate)]}
             elif calculate == 3:
                 self.result[3] += 1
-                new = {student_name:[int(enter_year),"3_4"]}
+                new = {student_name:[int(enter_year),str(calculate)]}
             else:
                 self.result[4] += 1
                 new = {student_name:[int(enter_year),"4_beyond"]}

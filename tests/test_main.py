@@ -49,7 +49,7 @@ class MainFlowTest(unittest.TestCase):
             run(input_fn=lambda prompt: next(answers), system_factory=FakeSystem)
 
         text = output.getvalue()
-        self.assertIn("最近 10 筆碩士畢業生紀錄中", text)
+        self.assertIn("實際取得 10 筆符合條件的碩士畢業生紀錄", text)
         self.assertNotIn("Detail searching", text)
         self.assertNotIn("進行口試", text)
 
