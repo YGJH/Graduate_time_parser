@@ -7,4 +7,5 @@ requires-python = ">=3.12"
 dependencies = [
     "ddddocr>=1.6.1",
     "mechanicalsoup>=1.4.0",
+    "selenium>=4.52.0",
 ]

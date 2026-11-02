@@ -1,16 +1,293 @@
-from urllib.parse import urljoin, urlsplit, urlunsplit
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
+from bs4 import BeautifulSoup
 from controller import id_converter
 import ddddocr
 import mechanicalsoup
 
 
 NYCU_BASE_URL = "https://etd.lib.nycu.edu.tw/"
+NYCU_NEW_HOME_URL = "https://thesis.lib.nycu.edu.tw/home"
 NYCU_SEARCH_URL = urljoin(
     NYCU_BASE_URL, "cgi-bin/gs32/gsweb.cgi/login?o=dwebmge"
 )
 CAPTCHA_FORM_SELECTOR = "body > div:nth-of-type(1) > form"
 CAPTCHA_BLOCK_SELECTOR = f"{CAPTCHA_FORM_SELECTOR} > div:nth-of-type(1)"
+
+
+def nycu_entry_year(student_id):
+    digits = re.sub(r"\D", "", student_id)
+    if len(digits) >= 9:
+        return int(f"1{digits[1:3]}")
+    return int(id_converter.NCTU(digits))
+
+
+def validated_nycu_entry_year(student_id, current_roc_year=None):
+    current_roc_year = current_roc_year or datetime.now().year - 1911
+    entry_year = nycu_entry_year(student_id)
+    return entry_year if entry_year <= current_roc_year else None
+
+
+@dataclass(frozen=True)
+class NycuThesis:
+    url: str
+    author: str
+    graduation_year: int
+    student_id: str
+    entry_year: int | None
+    year_difference: int | None
+
+
+def save_nycu_debug_html(html, page_name, debug_dir="debug_html"):
+    directory = Path(debug_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "-", page_name).strip("-")
+    path = directory / f"nycu-{safe_name or 'page'}-{timestamp}.html"
+    path.write_text(html, encoding="utf-8")
+
+    wanted = {"作者", "作者(中文)", "指導教授", "畢業學年度", "學號"}
+    page = BeautifulSoup(html, "html.parser")
+    labels = []
+    for text in page.stripped_strings:
+        label = text.rstrip(":：").strip()
+        if label in wanted and label not in labels:
+            labels.append(label)
+    return path, labels
+
+
+def nycu_sorted_results_url(current_url):
+    url = urlsplit(current_url)
+    query = dict(parse_qsl(url.query))
+    query.update(
+        {
+            "spc.page": "1",
+            "spc.sf": "dc.date.issued",
+            "spc.sd": "DESC",
+            "spc.rpp": "100",
+        }
+    )
+    return urlunsplit(
+        (url.scheme, url.netloc, url.path, urlencode(query), url.fragment)
+    )
+
+
+def extract_nycu_result_urls(html, current_url):
+    page = BeautifulSoup(html, "html.parser")
+    return [
+        urljoin(current_url, link["href"])
+        for link in page.select(
+            'li[data-test="list-object"] a.item-list-title[href]'
+        )
+    ]
+
+
+class NycuBrowserUnavailableError(RuntimeError):
+    pass
+
+
+def nycu_chrome_options():
+    from selenium.webdriver import ChromeOptions
+
+    options = ChromeOptions()
+    options.add_argument("--headless=new")
+    return options
+
+
+def create_nycu_driver(chrome_factory=None):
+    from selenium import webdriver
+    from selenium.common.exceptions import WebDriverException
+
+    chrome_factory = chrome_factory or webdriver.Chrome
+    try:
+        return chrome_factory(options=nycu_chrome_options())
+    except WebDriverException as error:
+        raise NycuBrowserUnavailableError(
+            "找不到或無法啟動 Chrome，請先安裝 Google Chrome。"
+        ) from error
+
+
+def _wait_for_nycu_css(driver, selector):
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as conditions
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    return WebDriverWait(driver, 20).until(
+        conditions.presence_of_element_located((By.CSS_SELECTOR, selector))
+    )
+
+
+def _report_nycu_debug(html, page_name, debug_dir):
+    path, labels = save_nycu_debug_html(html, page_name, debug_dir)
+    found = "、".join(labels) if labels else "找不到已知欄位標籤"
+    print(f"解析失敗，HTML 已儲存至：{path}")
+    print(f"HTML 中找到的欄位標籤：{found}")
+
+
+def search_nycu_theses(
+    driver,
+    advisor_name,
+    sample_count,
+    wait_for_css=None,
+    debug_dir="debug_html",
+):
+    wait_for_css = wait_for_css or _wait_for_nycu_css
+    driver.get(NYCU_NEW_HOME_URL)
+    search_input = wait_for_css(driver, "ds-search-form input")
+    search_input.clear()
+    search_input.send_keys(advisor_name)
+    wait_for_css(driver, "ds-search-form button").click()
+
+    try:
+        wait_for_css(
+            driver, 'li[data-test="list-object"] a.item-list-title'
+        )
+    except Exception:
+        _report_nycu_debug(driver.page_source, "search-results", debug_dir)
+        raise
+
+    driver.get(nycu_sorted_results_url(driver.current_url))
+    try:
+        wait_for_css(
+            driver, 'li[data-test="list-object"] a.item-list-title'
+        )
+    except Exception:
+        _report_nycu_debug(
+            driver.page_source, "sorted-search-results", debug_dir
+        )
+        raise
+
+    result_urls = extract_nycu_result_urls(
+        driver.page_source, driver.current_url
+    )
+    records = []
+    for index, url in enumerate(result_urls, start=1):
+        if len(records) >= int(sample_count):
+            break
+        print(f"論文連結：{url}")
+        driver.get(url)
+        try:
+            wait_for_css(driver, "ds-untyped-item")
+            record = parse_nycu_thesis(
+                driver.page_source, url, advisor_name
+            )
+        except Exception as error:
+            _report_nycu_debug(
+                driver.page_source, f"thesis-{index}", debug_dir
+            )
+            print(f"解析錯誤：{error}")
+            continue
+        if record is None:
+            continue
+
+        entry_year = (
+            record.entry_year if record.entry_year is not None else "年限未知"
+        )
+        year_difference = (
+            record.year_difference
+            if record.year_difference is not None
+            else "年限未知"
+        )
+        print(f"作者：{record.author}")
+        print(f"畢業年度：{record.graduation_year}")
+        print(f"學號：{record.student_id}")
+        print(f"入學年度：{entry_year}")
+        print(f"畢業年度 - 入學年度：{year_difference}")
+        records.append(record)
+    return records
+
+
+def _nycu_metadata_value(page, *labels):
+    normalized_labels = {label.rstrip(":：").strip() for label in labels}
+    label_node = page.find(
+        string=lambda text: text
+        and text.rstrip(":：").strip() in normalized_labels
+    )
+    if label_node is None:
+        return None
+
+    field = label_node.find_parent(
+        [
+            "ds-generic-item-page-field",
+            "ds-metadata-representation-list",
+            "ds-metadata-field-wrapper",
+        ]
+    )
+    if field is None:
+        field = label_node.parent
+    values = [span.get_text(" ", strip=True) for span in field.find_all("span")]
+    return " ".join(value for value in values if value).strip() or None
+
+
+def _nycu_positional_metadata(page):
+    root = page.find("ds-untyped-item")
+    columns = root.find_all("div", recursive=False) if root else []
+    if len(columns) < 2:
+        return {}
+
+    main_fields = columns[0].find_all(
+        "ds-generic-item-page-field", recursive=False
+    )
+    advisor_field = columns[1].find(
+        "ds-generic-item-page-field", recursive=False
+    )
+    author_field = columns[0].find(
+        "ds-metadata-representation-list", recursive=False
+    )
+
+    def text(field):
+        span = field.find("span") if field else None
+        return span.get_text(" ", strip=True) if span else None
+
+    return {
+        "advisor": text(advisor_field),
+        "author": text(author_field),
+        "graduation_year": text(main_fields[1]) if len(main_fields) > 1 else None,
+        "student_id": text(main_fields[3]) if len(main_fields) > 3 else None,
+    }
+
+
+def parse_nycu_thesis(html, url, advisor_name, current_roc_year=None):
+    page = BeautifulSoup(html, "html.parser")
+    positional = _nycu_positional_metadata(page)
+    advisor = (
+        _nycu_metadata_value(page, "指導教授", "指導教授：")
+        or positional.get("advisor")
+    )
+    if advisor_name not in re.split(r"[\s、,，;/；]+", advisor or ""):
+        return None
+
+    author = (
+        _nycu_metadata_value(page, "作者", "作者：", "作者(中文)")
+        or positional.get("author")
+    )
+    graduation_year_text = (
+        _nycu_metadata_value(page, "畢業學年度", "畢業學年度：")
+        or positional.get("graduation_year")
+    )
+    student_id = (
+        _nycu_metadata_value(page, "學號", "學號：")
+        or positional.get("student_id")
+    )
+    if not all((author, graduation_year_text, student_id)):
+        raise ValueError("論文頁缺少作者、畢業學年度或學號")
+
+    graduation_year = int(re.search(r"\d+", graduation_year_text).group())
+    entry_year = validated_nycu_entry_year(student_id, current_roc_year)
+    return NycuThesis(
+        url=url,
+        author=author,
+        graduation_year=graduation_year,
+        student_id=student_id,
+        entry_year=entry_year,
+        year_difference=(
+            graduation_year - entry_year if entry_year is not None else None
+        ),
+    )
 
 
 def solve_captcha(browser, classifier, max_attempts=3):
@@ -67,8 +344,42 @@ class LabCensusSystem:
         self.verbose_input = {}
         self.result = [0,0,0,0,0]
 
+    def load_nycu_records(self, records):
+        groups = ["1", "2", "2_3", "3_4", "4_beyond"]
+        for record in records:
+            if record.year_difference is None:
+                continue
+            result_index = min(max(record.year_difference, 0), 4)
+            self.result[result_index] += 1
+            chinese_name = re.search(r"[\u3400-\u9fff·]+", record.author)
+            student_name = chinese_name.group() if chinese_name else record.author
+            self.verbose_input[student_name] = [
+                record.entry_year,
+                groups[result_index],
+            ]
+        return self.verbose_input
+
+    def search_new_nycu(self, driver=None, wait_for_css=None):
+        owns_driver = driver is None
+        if owns_driver:
+            driver = create_nycu_driver()
+        try:
+            records = search_nycu_theses(
+                driver,
+                self.name,
+                self.sample_count,
+                wait_for_css=wait_for_css,
+            )
+            return self.load_nycu_records(records)
+        finally:
+            if owns_driver:
+                driver.quit()
+
     def Search(self):
         print("-----------------Searching...-----------------")
+
+        if self.school == "1":
+            return self.search_new_nycu()
 
         # 通過新版網站驗證碼後開啟查詢頁面
         browser = mechanicalsoup.StatefulBrowser()

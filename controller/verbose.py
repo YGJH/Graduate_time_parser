@@ -1,3 +1,6 @@
+import re
+from urllib.parse import urljoin
+
 from controller.lab_census_system import solve_captcha
 import ddddocr
 import mechanicalsoup
@@ -11,6 +14,75 @@ def open_ndltd_search_page(browser, classifier):
     solve_captcha(browser, classifier, max_attempts=3)
 
 
+def _field_text(page, label):
+    heading = page.find("th", string=lambda text: text and text.strip() == label)
+    if heading is None or heading.find_next_sibling() is None:
+        return None
+    return heading.find_next_sibling().get_text(" ", strip=True)
+
+
+def _advisor_names(page):
+    heading = page.find(
+        "th", string=lambda text: text and text.strip() == "指導教授:"
+    )
+    if heading is None or heading.find_next_sibling() is None:
+        return set()
+
+    cell = heading.find_next_sibling()
+    linked_names = {
+        link.get_text(" ", strip=True) for link in cell.find_all("a")
+    }
+    if linked_names:
+        return linked_names
+
+    return {
+        name
+        for name in re.split(r"[\s、,，;/；]+", cell.get_text(" ", strip=True))
+        if name
+    }
+
+
+def find_student_oral_defense(browser, student_name, advisor_name):
+    browser.select_form('form[name="main"]')
+    browser["qs0"] = student_name
+    browser["dcf"] = "au"
+    browser.submit_selected()
+
+    result_url = browser.get_url()
+    result_page = browser.get_current_page()
+    record_urls = [
+        urljoin(result_url, link["href"])
+        for link in result_page.find_all("a", href=True)
+        if "/record" in link["href"]
+    ]
+
+    found_student = False
+    found_undated_thesis = False
+    for record_url in record_urls:
+        browser.open(record_url)
+        record = browser.get_current_page()
+        record_student = _field_text(record, "研究生:")
+        if record_student != student_name:
+            continue
+
+        found_student = True
+        if advisor_name not in _advisor_names(record):
+            continue
+
+        oral_defense = _field_text(record, "口試日期:")
+        if oral_defense:
+            browser.open(result_url)
+            return "found", oral_defense
+        found_undated_thesis = True
+
+    browser.open(result_url)
+    if found_undated_thesis:
+        return "missing_date", None
+    if found_student:
+        return "advisor_mismatch", None
+    return "not_found", None
+
+
 class VerboseBooster:
     def __init__(self, name, sample_count, res, verbose_input):
         # data用來紀錄學生姓名、L串列紀錄各畢業時間的入學年與口試日期
@@ -18,7 +90,60 @@ class VerboseBooster:
         self.sample_count = sample_count
         self.res = res
         self.students = verbose_input
-        self.L1, self.L2, self.L3, self.L4, self.L5 = ([],[],[],[],[])
+        self.L1, self.L2, self.L3, self.L4, self.L5 = ([], [], [], [], [])
+        self.not_found = []
+        self.advisor_mismatch = []
+        self.missing_date = []
+        self.unreliable_details = []
+
+    def search_student_details(self, browser):
+        categories = {
+            "1": self.L1,
+            "2": self.L2,
+            "2_3": self.L3,
+            "3_4": self.L4,
+            "4_beyond": self.L5,
+        }
+        for student_name, (enter_year, graduation_group) in self.students.items():
+            status, oral_defense = find_student_oral_defense(
+                browser, student_name, self.name
+            )
+            if status == "not_found":
+                self.not_found.append(student_name)
+                continue
+            if status == "advisor_mismatch":
+                self.advisor_mismatch.append(student_name)
+                continue
+            if status == "missing_date":
+                self.missing_date.append(student_name)
+                continue
+
+            try:
+                western_enter_year_number = int(enter_year) + 1911
+                oral_defense_year = int(oral_defense.split("-", 1)[0])
+            except (AttributeError, TypeError, ValueError):
+                self.unreliable_details.append(student_name)
+                continue
+
+            study_years = oral_defense_year - western_enter_year_number
+            if study_years < 0 or study_years > 5:
+                self.unreliable_details.append(student_name)
+                continue
+
+            western_enter_year = f"{western_enter_year_number} 年"
+            categories[graduation_group].append(
+                [western_enter_year, oral_defense]
+            )
+
+    def show_unavailable_details(self):
+        unavailable = (
+            self.not_found
+            or self.advisor_mismatch
+            or self.missing_date
+            or self.unreliable_details
+        )
+        if unavailable:
+            print("部分學生的詳細資料無法確認，可能是休學、退學，或資料解析錯誤。")
 
     def show(self):
         print("--------------Detail searching...-------------")
@@ -27,67 +152,7 @@ class VerboseBooster:
         browser = mechanicalsoup.StatefulBrowser()
         ocr = ddddocr.DdddOcr(show_ad=False)
         open_ndltd_search_page(browser, ocr.classification)
-        browser.select_form('form[name="main"]')
-
-        # 填入資料並開始搜尋
-        browser["qs0"] = self.name
-        browser["dcf"] = "ad"
-        browser.submit_selected()
-        
-        # 紀錄網址中的ccd項
-        ccd = browser.get_url()
-        ccd = ccd[52:58:]
-
-        # 根據畢業年遞減排序
-        try:
-            browser.select_form('form[name="main"]')
-        except LinkNotFoundError:
-            print("系統過載，請稍後再試")
-        browser["sortby"] = "-yr"
-        browser["SubmitChangePage"] = "1"
-
-        # 進入第一筆資料，並取得資料網址
-        enter = f"/cgi-bin/gs32/gsweb.cgi/ccd={ccd}/record"
-        browser.follow_link(enter.strip())
-        now = browser.get_url()
-        
-        # 迴圈控制變數宣告
-        i = 0
-
-        # 利用迴圈依序進入每一筆資料
-        while  i < self.sample_count:
-            i += 1
-            now = now[:69] + str(i)
-            browser.open(now.strip())
-            access = browser.get_current_page()
-
-            # 取得學生名字，若學生名字存在data字典中，嘗試取得口試日期
-            student_name = access.body.form.div.table.tbody.tr.td.table.find("th", text="研究生:").find_next_sibling().get_text()
-            if student_name in self.students:
-                try:
-                    oral_defense = access.body.form.div.table.tbody.tr.td.table.find("th", text="口試日期:").find_next_sibling().get_text()
-    #                oral_defense = ''.join(c for c in oral_defense if c.isdigit())
-                    # 於data的對應key中加入口試日期，並將入學年以西元年表示，轉成string
-                    self.students[student_name].append(oral_defense)
-                    self.students[student_name][0] = f"{str(int(self.students[student_name][0])+1911)} 年"
-
-                    # 依照value中的畢業時間資訊分類至對應的L串列中
-                    if self.students[student_name][1] == "1":
-                        self.L1.append([self.students[student_name][0], self.students[student_name][2]])
-                    elif self.students[student_name][1] == "2":
-                        self.L2.append([self.students[student_name][0], self.students[student_name][2]])
-                    elif self.students[student_name][1] == "2_3":
-                        self.L3.append([self.students[student_name][0], self.students[student_name][2]])
-                    elif self.students[student_name][1] == "3_4":
-                        self.L4.append([self.students[student_name][0], self.students[student_name][2]])
-                    elif self.students[student_name][1] == "4_beyond":
-                        self.L5.append([self.students[student_name][0], self.students[student_name][2]])
-
-                # 若口試日期取得失敗，繼續迴圈
-                except AttributeError:
-                    continue
-
-
+        self.search_student_details(browser)
 
         # 輸出結果
         print(f"第一年畢業的 {self.res[0]} 位學生中：")
@@ -121,3 +186,5 @@ class VerboseBooster:
                 print(f"曾有人於 {time[0]} 入學，於 {time[1]} 進行口試")
         else:
             print("無資料")
+
+        self.show_unavailable_details()
