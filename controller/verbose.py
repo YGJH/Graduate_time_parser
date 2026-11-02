@@ -1,4 +1,14 @@
+from controller.lab_census_system import solve_captcha
+import ddddocr
 import mechanicalsoup
+
+
+NDLTD_SEARCH_URL = "https://ndltd.ncl.edu.tw/cgi-bin/gs32/gsweb.cgi/login?o=dwebmge"
+
+
+def open_ndltd_search_page(browser, classifier):
+    browser.open(NDLTD_SEARCH_URL)
+    solve_captcha(browser, classifier, max_attempts=3)
 
 
 class VerboseBooster:
@@ -13,10 +23,10 @@ class VerboseBooster:
     def show(self):
         print("--------------Detail searching...-------------")
 
-        # 開啟url
-        url = 'https://ndltd.ncl.edu.tw/cgi-bin/gs32/gsweb.cgi/login?o=dwebmge'
+        # 通過國圖網站可能出現的驗證碼後開啟查詢頁面
         browser = mechanicalsoup.StatefulBrowser()
-        browser.open(url)
+        ocr = ddddocr.DdddOcr(show_ad=False)
+        open_ndltd_search_page(browser, ocr.classification)
         browser.select_form('form[name="main"]')
 
         # 填入資料並開始搜尋

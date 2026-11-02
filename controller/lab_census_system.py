@@ -1,5 +1,57 @@
+from urllib.parse import urljoin, urlsplit, urlunsplit
+
 from controller import id_converter
+import ddddocr
 import mechanicalsoup
+
+
+NYCU_BASE_URL = "https://etd.lib.nycu.edu.tw/"
+NYCU_SEARCH_URL = urljoin(
+    NYCU_BASE_URL, "cgi-bin/gs32/gsweb.cgi/login?o=dwebmge"
+)
+CAPTCHA_FORM_SELECTOR = "body > div:nth-of-type(1) > form"
+CAPTCHA_BLOCK_SELECTOR = f"{CAPTCHA_FORM_SELECTOR} > div:nth-of-type(1)"
+
+
+def solve_captcha(browser, classifier, max_attempts=3):
+    for _ in range(max_attempts):
+        page = browser.get_current_page()
+        captcha_block = page.select_one(CAPTCHA_BLOCK_SELECTOR)
+        if captcha_block is None or captcha_block.find("img", recursive=False) is None:
+            return
+
+        image = captcha_block.find("img", recursive=False)
+        image_url = urljoin(browser.get_url(), image["src"])
+        image_response = browser.session.get(image_url)
+        image_response.raise_for_status()
+
+        inputs = captcha_block.find_all("input")
+        inputs[0]["value"] = classifier(image_response.content)
+        form = browser.select_form(CAPTCHA_FORM_SELECTOR)
+        form.choose_submit(inputs[1])
+        browser.submit_selected()
+
+        if browser.get_current_page().select_one(CAPTCHA_BLOCK_SELECTOR) is None:
+            return
+
+    raise RuntimeError(f"驗證碼辨識失敗，已重試 {max_attempts} 次")
+
+
+def open_nycu_search_page(browser, classifier):
+    browser.open(NYCU_SEARCH_URL)
+    solve_captcha(browser, classifier, max_attempts=3)
+
+
+def find_record_url_base(page, current_url):
+    record_link = page.find(
+        "a", href=lambda href: href is not None and "/record?" in href
+    )
+    if record_link is None:
+        raise RuntimeError("搜尋結果中找不到論文紀錄連結")
+
+    record_url = urlsplit(urljoin(current_url, record_link["href"]))
+    return urlunsplit((record_url.scheme, record_url.netloc, record_url.path, "", ""))
+
 
 class LabCensusSystem:
     def __init__(self, school, name, sample_count, filter_cnt):
@@ -18,10 +70,10 @@ class LabCensusSystem:
     def Search(self):
         print("-----------------Searching...-----------------")
 
-        # 開啟url
-        url = 'http://etd.lib.nctu.edu.tw/cgi-bin/gs32/gsweb.cgi/login?o=dwebmge'
+        # 通過新版網站驗證碼後開啟查詢頁面
         browser = mechanicalsoup.StatefulBrowser()
-        browser.open(url)
+        ocr = ddddocr.DdddOcr(show_ad=False)
+        open_nycu_search_page(browser, ocr.classification)
         browser.select_form('form[name="main"]')
 
         # 填入資料並開始搜尋
@@ -30,19 +82,15 @@ class LabCensusSystem:
         browser["limitdb"] = int(self.school)-1
         browser.submit_selected()
 
-        # 紀錄網址中的ccd項
-        ccd = browser.get_url()
-        ccd = ccd[54:60:]
+        # 從搜尋結果中的實際連結取得紀錄網址，避免依賴網址字元位置
+        record_url_base = find_record_url_base(
+            browser.get_current_page(), browser.get_url()
+        )
 
         # 根據畢業年遞減排序
         browser.select_form('form[name="main"]')
         browser["sortby"] = "-yr"
         # browser["SubmitChangePage"] = "1"
-
-        # 進入第一筆資料，並取得資料網址
-        enter = f"/cgi-bin/gs32/gsweb.cgi/ccd={ccd}/record"
-        browser.follow_link(enter.strip())
-        now = browser.get_url()
 
         # Y2：兩年畢業、Y2_3：兩年以上三年以下畢業，以此類推；previous_number用來紀錄前一筆的學號
         previous_number, i = 0, 0
@@ -54,8 +102,8 @@ class LabCensusSystem:
         cnt = self.sample_count
         while i < cnt:
             i += 1
-            now = now[:71] + str(i)
-            browser.open(now.strip())
+            now = f"{record_url_base}?r1={i}"
+            browser.open(now)
             access = browser.get_current_page()
 
             # 避免過度過濾導致無窮迴圈
